@@ -1,0 +1,12 @@
+# Ignore files with no extension (compiled C programs)...
+*
+# ...but keep files that have an extension, and keep folders
+!*.*
+!*/
+
+# macOS debug symbols, editor swap files, archives, build output
+*.dSYM/
+*.swp
+*.zip
+build/
+.DS_Store
