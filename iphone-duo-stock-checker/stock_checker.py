@@ -9,6 +9,7 @@ Only uses the Python standard library. Run with --help for options.
 """
 
 import argparse
+import http.cookiejar
 import json
 import platform
 import random
@@ -35,22 +36,58 @@ def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-def fetch_availability(store_url, part, zip_code):
-    query = urllib.parse.urlencode({
-        "pl": "true",
-        "mts.0": "regular",
-        "mts.1": "compact",
-        "parts.0": part,
-        "location": zip_code,
-    })
-    url = f"{store_url}/shop/fulfillment-messages?{query}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        "Referer": f"{store_url}/shop/buy-iphone",
-    })
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.load(resp)
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+class AppleSession:
+    """Talks to Apple like a browser would: visits the store first to pick up
+    cookies, then reuses them for availability checks. Apple rejects bare
+    requests without these (HTTP 541)."""
+
+    def __init__(self, store_url):
+        self.store_url = store_url
+        self.cookies = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
+        self.primed = False
+
+    def prime(self):
+        req = urllib.request.Request(f"{self.store_url}/shop/buy-iphone", headers={
+            **BROWSER_HEADERS,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        with self.opener.open(req, timeout=20) as resp:
+            resp.read()
+        self.primed = True
+
+    def fetch_availability(self, part, zip_code):
+        if not self.primed:
+            self.prime()
+        query = urllib.parse.urlencode({
+            "fae": "true",
+            "pl": "true",
+            "mts.0": "regular",
+            "mts.1": "compact",
+            "parts.0": part,
+            "searchNearby": "true",
+            "location": zip_code,
+        })
+        req = urllib.request.Request(f"{self.store_url}/shop/fulfillment-messages?{query}", headers={
+            **BROWSER_HEADERS,
+            "Accept": "*/*",
+            "Referer": f"{self.store_url}/shop/buy-iphone",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Aos-Ui-Fetch-Call-1": "true",
+            "X-Skip-Redirect": "true",
+        })
+        try:
+            with self.opener.open(req, timeout=20) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError:
+            self.primed = False  # get fresh cookies on the next try
+            raise
 
 
 def parse_availability(data, part):
@@ -120,12 +157,13 @@ def main():
     args = p.parse_args()
 
     log(f"Watching {args.part} (iPhone Duo 256GB Star White) near {args.zip}, every {args.interval}s. Ctrl+C to stop.")
+    session = AppleSession(args.store_url.rstrip("/"))
     was_available = False
     failures = 0
 
     while True:
         try:
-            data = fetch_availability(args.store_url, args.part, args.zip)
+            data = session.fetch_availability(args.part, args.zip)
             in_stock, delivery, checked = parse_availability(data, args.part)
             failures = 0
 
@@ -143,7 +181,8 @@ def main():
                 was_available = False
         except urllib.error.HTTPError as e:
             failures += 1
-            log(f"Apple returned HTTP {e.code}" + (" (rate limited, backing off)" if e.code in (403, 429, 503, 541) else ""))
+            body = e.read(300).decode(errors="replace").strip().replace("\n", " ")
+            log(f"Apple returned HTTP {e.code} from {e.url.split('?')[0]}, retrying later. {body}")
         except Exception as e:
             failures += 1
             log(f"Check failed: {e}")
